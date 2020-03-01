@@ -593,12 +593,6 @@ class FileDifference(object):
         # Target file data identical to source (may still be renamed)
         pass
 
-  def EmitVerification(self, script, package_download_url):
-    error_msg = "Failed to apply update, please download full package at " + package_download_url
-    for tf, sf, _, _ in self.patch_list:
-      sf.name = FixUpPartitionPath("/" + sf.name)
-      script.FileCheck(sf.name, sf.sha1, error_msg)
-
   def RemoveUnneededFiles(self, script, extras=()):
     file_list = ["/" + i for i in self.source_data
                   if i not in self.target_data and i not in self.renames]
@@ -2658,12 +2652,15 @@ def WriteIncrementalOTAPackage(target_zip, source_zip, output_file):
     script.CheckAndUnmount("/product")
     script.Mount("/product")
 
-  root_diff.EmitVerification(script, package_download_url)
-  system_diff.EmitVerification(script, package_download_url)
-  if vendor_diff:
-    vendor_diff.EmitVerification(script, package_download_url)
-  if product_diff:
-    product_diff.EmitVerification(script, package_download_url)
+  error_msg = "Failed to apply update, please download full package at https://sourceforge.net/LLuviaOS/5.X" + device
+
+  prop_path = "/" + GetSystemBasePath() + "/system/build.prop"
+
+  source_version_prop = "org.lluvia.version.display"
+
+  source_version = os.path.splitext(os.path.basename(OPTIONS.incremental_source))[0]
+
+  script.IncrementalFileBasedSourceVersionCheck(prop_path, source_version_prop, source_version, error_msg)
 
   common.ZipWriteStr(output_zip, "boot.img", target_boot.data)
 
