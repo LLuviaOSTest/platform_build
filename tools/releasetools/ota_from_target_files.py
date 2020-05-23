@@ -526,21 +526,25 @@ def LoadPartitionFiles(z, partition):
       out[fn] = common.File(fn, data, info.compress_size)
   return out
 
+def GetSystemBasePath():
+  if OPTIONS.target_info_dict.get("system_root_image") == "true":
+    return "system_root"
+  else:
+    return "system"
+
 def FixUpPartitionPath(path):
   preprend_bar = False
   if path.startswith('/'):
     path = path[1:]
     preprend_bar = True
   if path == 'root':
-    path = "mnt/system"
+    path = GetSystemBasePath()
   elif path == 'system':
-    path = "mnt/system/system"
+    path = GetSystemBasePath() + "/system"
   elif path.startswith('root/'):
-    path = "mnt/system/" + path[5:]
+    path = GetSystemBasePath() + "/" + path[5:]
   elif path.startswith('system/'):
-    path = "mnt/system/system/" + path[7:]
-  else:
-    path = "mnt/" + path
+    path = GetSystemBasePath() + "/system/" + path[7:]
   if preprend_bar:
     path = "/" + path
   return path
@@ -586,7 +590,7 @@ class FileDifference(object):
         pass
 
   def EmitVerification(self, script, package_download_url):
-    error_msg = "You can\'t upgrade to this version, please download full package in " + package_download_url
+    error_msg = "Failed to apply update, please download full package at " + package_download_url
     for tf, sf, _, _ in self.patch_list:
       sf.name = FixUpPartitionPath("/" + sf.name)
       script.FileCheck(sf.name, sf.sha1, error_msg)
@@ -2524,6 +2528,302 @@ def WriteABOTAPackageWithBrilloScript(target_file, output_file,
   )
   FinalizeMetadata(metadata, staging_file, output_file, needed_property_files)
 
+def WriteIncrementalOTAPackage(target_zip, source_zip, output_file):
+  target_info = BuildInfo(OPTIONS.target_info_dict, OPTIONS.oem_dicts)
+  source_info = BuildInfo(OPTIONS.source_info_dict, OPTIONS.oem_dicts)
+
+  source_api_version = OPTIONS.source_info_dict["recovery_api_version"]
+  target_api_version = OPTIONS.target_info_dict["recovery_api_version"]
+
+  if source_api_version == 0:
+    logger.warning(
+        "Generating edify script for a source that can't install it.")
+
+  script = edify_generator.EdifyGenerator(
+      source_api_version, target_info, fstab=source_info["fstab"])
+
+  recovery_mount_options = OPTIONS.source_info_dict.get(
+      "recovery_mount_options")
+  source_oem_props = OPTIONS.source_info_dict.get("oem_fingerprint_properties")
+  target_oem_props = OPTIONS.target_info_dict.get("oem_fingerprint_properties")
+  oem_dicts = None
+  if source_oem_props or target_oem_props:
+    oem_dicts = _LoadOemDicts(script)
+
+  metadata = GetPackageMetadata(target_info, source_info)
+
+  if not OPTIONS.no_signing:
+    staging_file = common.MakeTempFile(suffix='.zip')
+  else:
+    staging_file = output_file
+
+  output_zip = zipfile.ZipFile(
+      staging_file, "w", compression=zipfile.ZIP_DEFLATED)
+
+  if HasVendorPartition(target_zip):
+    if not HasVendorPartition(source_zip):
+      raise RuntimeError("can't generate incremental that adds /vendor")
+
+  if HasProductPartition(target_zip):
+    if not HasProductPartition(source_zip):
+      raise RuntimeError("can't generate incremental that adds /product")
+
+  device_specific = common.DeviceSpecificParams(
+      source_zip=source_zip,
+      source_api_version=source_api_version,
+      source_tmp=OPTIONS.source_tmp,
+      target_zip=target_zip,
+      target_api_version=target_api_version,
+      target_tmp=OPTIONS.target_tmp,
+      output_zip=output_zip,
+      script=script,
+      metadata=metadata,
+      info_dict=source_info)
+
+  root_diff = FileDifference("root", source_zip, target_zip, output_zip)
+  system_diff = FileDifference("system", source_zip, target_zip, output_zip)
+
+  if HasVendorPartition(target_zip):
+    vendor_diff = FileDifference("vendor", source_zip, target_zip, output_zip)
+  else:
+    vendor_diff = None
+
+  if HasProductPartition(target_zip):
+    product_diff = FileDifference("product_diff", source_zip, target_zip, output_zip)
+  else:
+    product_diff = None
+
+  metadata["pre-build"] = source_info.fingerprint
+  metadata["post-build"] = target_info.fingerprint
+  metadata["pre-build-incremental"] = source_info.GetBuildProp(
+        'ro.build.version.incremental')
+  metadata["post-build-incremental"] = target_info.GetBuildProp(
+        'ro.build.version.incremental')
+
+  source_boot = common.GetBootableImage(
+      "/tmp/boot.img", "boot.img", OPTIONS.source_tmp, "BOOT",
+      OPTIONS.source_info_dict)
+  target_boot = common.GetBootableImage(
+      "/tmp/boot.img", "boot.img", OPTIONS.target_tmp, "BOOT")
+
+  target_info.WriteDeviceAssertions(script, OPTIONS.oem_no_mount)
+  device_specific.IncrementalOTA_Assertions()
+
+  android_version = target_info.GetBuildProp("ro.build.version.release")
+  device = target_info.GetBuildProp("org.lluvia.device")
+
+  prev_build_id = source_info.GetBuildProp("ro.build.id")
+  build_id = target_info.GetBuildProp("ro.build.id")
+
+  prev_build_date = source_info.GetBuildProp("org.lluvia.build_date")
+  build_date = target_info.GetBuildProp("org.lluvia.build_date")
+
+  prev_security_patch = source_info.GetBuildProp("ro.build.version.security_patch")
+  security_patch = target_info.GetBuildProp("ro.build.version.security_patch")
+
+  script.Print("-------------------------------------------------------------");
+  script.Print("              LLUVIA OS 5.X			");
+  script.Print("		  REBORN				");
+  script.Print("by Anush MK,Sriram Prakya,Srijith Bharadwaj & Manish Sarkar");
+  script.Print("-------------------------------------------------------------");
+  script.Print(" Android version: %s"%(android_version));
+  if prev_build_id != build_id:
+    script.Print(" Build id: %s -> %s"%(prev_build_id, build_id));
+  else:
+    script.Print(" Build id: %s"%(build_id));
+  script.Print(" Build date: %s -> %s"%(prev_build_date, build_date));
+  if prev_security_patch != security_patch:
+    script.Print(" Security patch: %s -> %s"%(prev_security_patch, security_patch));
+  else:
+    script.Print(" Security patch: %s"%(security_patch));
+  script.Print(" Device: %s"%(device));
+  script.Print("----------------------------------------------");
+
+  script.Print("Verifying current system...")
+
+  package_download_url = "https://sourceforge.net/LLuviaOS/5.X" + device
+
+  device_specific.IncrementalOTA_VerifyBegin()
+
+  script.ShowProgress(0.1, 0)
+
+  script.Comment("---- start making verification here ----")
+
+  script.CheckAndUnmount("/" + GetSystemBasePath())
+
+  script.fstab["/system"].mount_point = "/" + GetSystemBasePath()
+  script.Mount("/system")
+
+  if HasVendorPartition(target_zip):
+    script.CheckAndUnmount("/vendor")
+    script.Mount("/vendor")
+
+  if HasProductPartition(target_zip):
+    script.CheckAndUnmount("/product")
+    script.Mount("/product")
+
+  root_diff.EmitVerification(script, package_download_url)
+  system_diff.EmitVerification(script, package_download_url)
+  if vendor_diff:
+    vendor_diff.EmitVerification(script, package_download_url)
+  if product_diff:
+    product_diff.EmitVerification(script, package_download_url)
+
+  common.ZipWriteStr(output_zip, "boot.img", target_boot.data)
+
+  device_specific.IncrementalOTA_VerifyEnd()
+
+  script.Comment("---- start making changes here ----")
+
+  device_specific.IncrementalOTA_InstallBegin()
+
+  script.Print("Updating system...")
+
+  script.WriteRawImage("/boot", "boot.img")
+
+  script.ShowProgress(0.1, 10)
+
+  root_diff.RemoveUnneededFiles(script)
+  system_diff.RemoveUnneededFiles(script)
+  if vendor_diff:
+    vendor_diff.RemoveUnneededFiles(script)
+  if product_diff:
+    product_diff.RemoveUnneededFiles(script)
+
+  root_items = ItemSet("root", "META/root_filesystem_config.txt")
+  system_items = ItemSet("system", "META/filesystem_config.txt")
+  if vendor_diff:
+    vendor_items = ItemSet("vendor", "META/vendor_filesystem_config.txt")
+  if product_diff:
+    product_items = ItemSet("product", "META/product_filesystem_config.txt")
+
+  target_symlinks = CopyPartitionFiles(root_items, target_zip, None)
+  target_symlinks.extend(CopyPartitionFiles(system_items, target_zip, None))
+  if vendor_diff:
+    target_symlinks.extend(CopyPartitionFiles(vendor_items, target_zip, None))
+  if product_diff:
+    target_symlinks.extend(CopyPartitionFiles(product_items, target_zip, None))
+
+  temp_script = script.MakeTemporary()
+  root_items.GetMetadata(target_zip)
+  root_items.Get("root").SetPermissions(temp_script)
+  system_items.GetMetadata(target_zip)
+  system_items.Get("system").SetPermissions(temp_script)
+  if vendor_diff:
+    vendor_items.GetMetadata(target_zip)
+    vendor_items.Get("vendor").SetPermissions(temp_script)
+  if product_diff:
+    product_items.GetMetadata(target_zip)
+    product_items.Get("product").SetPermissions(temp_script)
+
+  # Note that this call will mess up the trees of Items, so make sure
+  # we're done with them.
+  source_symlinks = CopyPartitionFiles(root_items, source_zip, None)
+  source_symlinks.extend(CopyPartitionFiles(system_items, source_zip, None))
+  if vendor_diff:
+    source_symlinks.extend(CopyPartitionFiles(vendor_items, source_zip, None))
+  if product_diff:
+    source_symlinks.extend(CopyPartitionFiles(product_items, source_zip, None))
+
+  target_symlinks_d = dict([(i[1], i[0]) for i in target_symlinks])
+  source_symlinks_d = dict([(i[1], i[0]) for i in source_symlinks])
+
+  # Delete all the symlinks in source that aren't in target.  This
+  # needs to happen before files are unpacked, in case a
+  # symlink in the source is replaced by a real file in the target.
+
+  # If a symlink in the source will be replaced by a regular file, we cannot
+  # delete the symlink/file in case the package gets applied again. For such
+  # a symlink, we prepend a sha1_check() to detect if it has been updated.
+  # (Bug: 23646151)
+  replaced_symlinks = dict()
+  for tf, sf, _, _ in root_diff.patch_list:
+    replaced_symlinks["/%s" % (sf.name,)] = tf.name
+  for tf, sf, _, _ in system_diff.patch_list:
+    replaced_symlinks["/%s" % (sf.name,)] = tf.name
+  if vendor_diff:
+    for tf, sf, _, _ in vendor_diff.patch_list:
+      replaced_symlinks["/%s" % (sf.name,)] = tf.name
+  if product_diff:
+    for tf, sf, _, _ in product_diff.patch_list:
+      replaced_symlinks["/%s" % (sf.name,)] = tf.name
+
+  for tf in root_diff.renames.values():
+    replaced_symlinks["/%s" % (tf.name,)] = tf.sha1
+  for tf in system_diff.renames.values():
+    replaced_symlinks["/%s" % (tf.name,)] = tf.sha1
+  if vendor_diff:
+    for tf in vendor_diff.renames.values():
+      replaced_symlinks["/%s" % (tf.name,)] = tf.sha1
+  if product_diff:
+    for tf in product_diff.renames.values():
+      replaced_symlinks["/%s" % (tf.name,)] = tf.sha1
+
+  always_delete = []
+  may_delete = []
+  for dest, link in source_symlinks:
+    if link not in target_symlinks_d:
+      if link in replaced_symlinks:
+        may_delete.append((link, replaced_symlinks[link]))
+      else:
+        always_delete.append(link)
+  script.DeleteFiles(always_delete)
+  script.DeleteFilesIfNotMatching(may_delete)
+
+  script.UnpackPackageDir("root", "/" + GetSystemBasePath())
+  script.UnpackPackageDir("system", "/" + GetSystemBasePath() + "/system")
+  if vendor_diff:
+    script.UnpackPackageDir("vendor", "/vendor")
+  if product_diff:
+    script.UnpackPackageDir("product", "/product")
+
+  root_diff.EmitRenames(script)
+  system_diff.EmitRenames(script)
+  if vendor_diff:
+    vendor_diff.EmitRenames(script)
+  if product_diff:
+    product_diff.EmitRenames(script)
+
+  # Create all the symlinks that don't already exist, or point to
+  # somewhere different than what we want.  Delete each symlink before
+  # creating it, since the 'symlink' command won't overwrite.
+  to_create = []
+  for dest, link in target_symlinks:
+    if link in source_symlinks_d:
+      if dest != source_symlinks_d[link]:
+        to_create.append((dest, link))
+    else:
+      to_create.append((dest, link))
+  script.DeleteFiles([i[1] for i in to_create])
+  script.MakeSymlinks(to_create)
+
+  # Now that the symlinks are created, we can set all the
+  # permissions.
+  script.AppendScript(temp_script)
+
+  # Unmount
+  script.UnmountAll()
+
+  # Do device-specific installation (eg, write radio image).
+  device_specific.IncrementalOTA_InstallEnd()
+
+  if OPTIONS.extra_script is not None:
+    script.AppendExtra(OPTIONS.extra_script)
+
+  script.SetProgress(1)
+
+  script.AddToZip(target_zip, output_zip, input_path=OPTIONS.updater_binary)
+  metadata["ota-required-cache"] = str(script.required_cache)
+
+  # We haven't written the metadata entry yet, which will be handled in
+  # FinalizeMetadata().
+  common.ZipClose(output_zip)
+
+  # Sign the generated zip package unless no_signing is specified.
+  needed_property_files = (
+      NonAbOtaPropertyFiles(),
+  )
+  FinalizeMetadata(metadata, staging_file, output_file, needed_property_files)
 
 def main(argv):
 
