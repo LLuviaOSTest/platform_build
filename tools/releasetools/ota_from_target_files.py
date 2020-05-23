@@ -222,6 +222,8 @@ if OPTIONS.worker_threads == 0:
 OPTIONS.two_step = False
 OPTIONS.include_secondary = False
 OPTIONS.no_signing = False
+OPTIONS.incremental_block_based = False
+OPTIONS.incremental_blacklisted_files = ['system/recovery-from-boot.p', 'system/bin/install-recovery.sh']
 OPTIONS.block_based = True
 OPTIONS.updater_binary = None
 OPTIONS.oem_source = None
@@ -251,6 +253,366 @@ DYNAMIC_PARTITION_INFO = 'META/dynamic_partitions_info.txt'
 AB_PARTITIONS = 'META/ab_partitions.txt'
 UNZIP_PATTERN = ['IMAGES/*', 'INSTALL/*', 'META/*', 'RADIO/*']
 RETROFIT_DAP_UNZIP_PATTERN = ['OTA/super_*.img', AB_PARTITIONS]
+
+def MostPopularKey(d, default):
+  """Given a dict, return the key corresponding to the largest
+  value.  Returns 'default' if the dict is empty."""
+  x = [(v, k) for (k, v) in d.iteritems()]
+  if not x:
+    return default
+  x.sort()
+  return x[-1][1]
+
+def IsSymlink(info):
+  """Return true if the zipfile.ZipInfo object passed in represents a
+  symlink."""
+  return (info.external_attr >> 16) & 0o770000 == 0o120000
+
+def ClosestFileMatch(src, tgtfiles, existing):
+  """Returns the closest file match between a source file and list
+     of potential matches.  The exact filename match is preferred,
+     then the sha1 is searched for, and finally a file with the same
+     basename is evaluated."""
+
+  result = tgtfiles.get("path:" + src.name)
+  if result is not None:
+    return result
+
+  if src.size < 1000:
+    return None
+
+  result = tgtfiles.get("sha1:" + src.sha1)
+  if result is not None and existing.get(result.name) is None:
+    return result
+  result = tgtfiles.get("file:" + src.name.split("/")[-1])
+  if result is not None and existing.get(result.name) is None:
+    return result
+  return None
+
+class ItemSet(object):
+  def __init__(self, partition, fs_config):
+    self.partition = partition
+    self.fs_config = fs_config
+    self.ITEMS = {}
+
+  def Get(self, name, is_dir=False):
+    if name not in self.ITEMS:
+      self.ITEMS[name] = Item(self, name, is_dir=is_dir)
+    return self.ITEMS[name]
+
+  def GetMetadata(self, input_zip):
+    # The target_files contains a record of what the uid,
+    # gid, and mode are supposed to be.
+    output = input_zip.read(self.fs_config)
+
+    for line in output.split("\n"):
+      if not line:
+        continue
+      columns = line.split()
+      name, uid, gid, mode = columns[:4]
+      selabel = None
+      capabilities = None
+
+      # After the first 4 columns, there are a series of key=value
+      # pairs. Extract out the fields we care about.
+      for element in columns[4:]:
+        key, value = element.split("=")
+        if key == "selabel":
+          selabel = value
+        if key == "capabilities":
+          capabilities = value
+
+      if name == "":
+        name = self.partition
+      elif self.partition == "root":
+        name = "root/" + name
+
+      i = self.ITEMS.get(name, None)
+      if i is not None:
+        i.uid = int(uid)
+        i.gid = int(gid)
+        i.mode = int(mode, 8)
+        i.selabel = selabel
+        i.capabilities = capabilities
+        if i.is_dir:
+          i.children.sort(key=lambda i: i.name)
+
+class Item(object):
+  """Items represent the metadata (user, group, mode) of files and
+  directories in the system image."""
+  def __init__(self, itemset, name, is_dir=False):
+    self.itemset = itemset
+    self.name = name
+    self.uid = None
+    self.gid = None
+    self.mode = None
+    self.selabel = None
+    self.capabilities = None
+    self.is_dir = is_dir
+    self.descendants = None
+    self.best_subtree = None
+
+    if name:
+      self.parent = itemset.Get(os.path.dirname(name), is_dir=True)
+      self.parent.children.append(self)
+    else:
+      self.parent = None
+    if self.is_dir:
+      self.children = []
+
+  def Dump(self, indent=0):
+    if self.uid is not None:
+      print("%s%s %d %d %o" % (
+          "  " * indent, self.name, self.uid, self.gid, self.mode))
+    else:
+      print("%s%s %s %s %s" % (
+          "  " * indent, self.name, self.uid, self.gid, self.mode))
+    if self.is_dir:
+      print("%s%s" % ("  " * indent, self.descendants))
+      print("%s%s" % ("  " * indent, self.best_subtree))
+      for i in self.children:
+        i.Dump(indent=indent+1)
+
+  def CountChildMetadata(self):
+    """Count up the (uid, gid, mode, selabel, capabilities) tuples for
+    all children and determine the best strategy for using set_perm_recursive
+    and set_perm to correctly chown/chmod all the files to their desired
+    values.  Recursively calls itself for all descendants.
+    Returns a dict of {(uid, gid, dmode, fmode, selabel, capabilities): count}
+    counting up all descendants of this node.  (dmode or fmode may be None.)
+    Also sets the best_subtree of each directory Item to the (uid, gid, dmode,
+    fmode, selabel, capabilities) tuple that will match the most descendants of
+    that Item.
+    """
+
+    assert self.is_dir
+    key = (self.uid, self.gid, self.mode, None, self.selabel,
+           self.capabilities)
+    self.descendants = {key: 1}
+    d = self.descendants
+    for i in self.children:
+      if i.is_dir:
+        for k, v in i.CountChildMetadata().iteritems():
+          d[k] = d.get(k, 0) + v
+      else:
+        k = (i.uid, i.gid, None, i.mode, i.selabel, i.capabilities)
+        d[k] = d.get(k, 0) + 1
+
+    # Find the (uid, gid, dmode, fmode, selabel, capabilities)
+    # tuple that matches the most descendants.
+
+    # First, find the (uid, gid) pair that matches the most
+    # descendants.
+    ug = {}
+    for (uid, gid, _, _, _, _), count in d.iteritems():
+      ug[(uid, gid)] = ug.get((uid, gid), 0) + count
+    ug = MostPopularKey(ug, (0, 0))
+
+    # Now find the dmode, fmode, selabel, and capabilities that match
+    # the most descendants with that (uid, gid), and choose those.
+    best_dmode = (0, 0o755)
+    best_fmode = (0, 0o644)
+    best_selabel = (0, None)
+    best_capabilities = (0, None)
+    for k, count in d.iteritems():
+      if k[:2] != ug:
+        continue
+      if k[2] is not None and count >= best_dmode[0]:
+        best_dmode = (count, k[2])
+      if k[3] is not None and count >= best_fmode[0]:
+        best_fmode = (count, k[3])
+      if k[4] is not None and count >= best_selabel[0]:
+        best_selabel = (count, k[4])
+      if k[5] is not None and count >= best_capabilities[0]:
+        best_capabilities = (count, k[5])
+    self.best_subtree = ug + (
+        best_dmode[1], best_fmode[1], best_selabel[1], best_capabilities[1])
+
+    return d
+
+  def SetPermissions(self, script):
+    """Append set_perm/set_perm_recursive commands to 'script' to
+    set all permissions, users, and groups for the tree of files
+    rooted at 'self'."""
+
+    self.CountChildMetadata()
+
+    def recurse(item, current):
+      # current is the (uid, gid, dmode, fmode, selabel, capabilities) tuple
+      # that the current item (and all its children) have already been set to.
+      # We only need to issue set_perm/set_perm_recursive commands if we're
+      # supposed to be something different.
+      item_path = FixUpPartitionPath("/" + item.name)
+
+      if item.is_dir:
+        if current != item.best_subtree:
+          script.SetPermissionsRecursive(item_path, *item.best_subtree)
+          current = item.best_subtree
+
+        if item.name not in OPTIONS.incremental_blacklisted_files or \
+           item.uid != current[0] or item.gid != current[1] or \
+           item.mode != current[2] or item.selabel != current[4] or \
+           item.capabilities != current[5]:
+           if item.uid is not None and item.gid is not None and item.mode is not None:
+              script.SetPermissions(item_path, item.uid, item.gid,
+                                    item.mode, item.selabel, item.capabilities)
+
+        for i in item.children:
+          recurse(i, current)
+      else:
+        if item.name not in OPTIONS.incremental_blacklisted_files or \
+               item.uid != current[0] or item.gid != current[1] or \
+               item.mode != current[3] or item.selabel != current[4] or \
+               item.capabilities != current[5]:
+          script.SetPermissions(item_path, item.uid, item.gid,
+                                item.mode, item.selabel, item.capabilities)
+
+    recurse(self, (-1, -1, -1, -1, None, None))
+
+def CopyPartitionFiles(itemset, input_zip, output_zip=None, substitute=None):
+  """Copies files for the partition in the input zip to the output
+  zip.  Populates the Item class with their metadata, and returns a
+  list of symlinks.  output_zip may be None, in which case the copy is
+  skipped (but the other side effects still happen).  substitute is an
+  optional dict of {output filename: contents} to be output instead of
+  certain input files.
+  """
+
+  symlinks = []
+
+  partition = itemset.partition
+
+  for info in input_zip.infolist():
+    if info.filename.lower() in OPTIONS.incremental_blacklisted_files:
+      continue
+    prefix = partition.upper() + "/"
+    if info.filename.startswith(prefix):
+      basefilename = info.filename[len(prefix):]
+      if IsSymlink(info):
+        root_path = FixUpPartitionPath("/" + partition)
+        symlinks.append((input_zip.read(info.filename),
+                         root_path + "/" + basefilename))
+      else:
+        info2 = copy.copy(info)
+        fn = info2.filename = partition + "/" + basefilename
+        if substitute and fn in substitute and substitute[fn] is None:
+          continue
+        if output_zip is not None:
+          if substitute and fn in substitute:
+            data = substitute[fn]
+          else:
+            data = input_zip.read(info.filename)
+          common.ZipWriteStr(output_zip, info2, data)
+        if fn.endswith("/"):
+          itemset.Get(fn[:-1], is_dir=True)
+        else:
+          itemset.Get(fn)
+
+  symlinks.sort()
+  return symlinks
+
+def LoadPartitionFiles(z, partition):
+  """Load all the files from the given partition in a given target-files
+  ZipFile, and return a dict of {filename: File object}."""
+  out = {}
+  prefix = partition.upper() + "/"
+  for info in z.infolist():
+    if info.filename.lower() in OPTIONS.incremental_blacklisted_files:
+      continue
+    if info.filename.startswith(prefix) and not IsSymlink(info):
+      basefilename = info.filename[len(prefix):]
+      fn = partition + "/" + basefilename
+      data = z.read(info.filename)
+      out[fn] = common.File(fn, data, info.compress_size)
+  return out
+
+def FixUpPartitionPath(path):
+  preprend_bar = False
+  if path.startswith('/'):
+    path = path[1:]
+    preprend_bar = True
+  if path == 'root':
+    path = "mnt/system"
+  elif path == 'system':
+    path = "mnt/system/system"
+  elif path.startswith('root/'):
+    path = "mnt/system/" + path[5:]
+  elif path.startswith('system/'):
+    path = "mnt/system/system/" + path[7:]
+  else:
+    path = "mnt/" + path
+  if preprend_bar:
+    path = "/" + path
+  return path
+
+class FileDifference(object):
+  def __init__(self, partition, source_zip, target_zip, output_zip):
+    self.partition = partition
+    print("Loading target of " + partition + " partition ...")
+    self.target_data = target_data = LoadPartitionFiles(target_zip, partition)
+    print("Loading source of " + partition + " partition ...")
+    self.source_data = source_data = LoadPartitionFiles(source_zip, partition)
+
+    self.patch_list = patch_list = []
+    self.renames = renames = {}
+
+    matching_file_cache = {}
+    for fn, sf in source_data.items():
+      assert fn == sf.name
+      matching_file_cache["path:" + fn] = sf
+      # Only allow eligibility for filename/sha matching
+      # if there isn't a perfect path match.
+      if target_data.get(sf.name) is None:
+        matching_file_cache["file:" + fn.split("/")[-1]] = sf
+        matching_file_cache["sha:" + sf.sha1] = sf
+
+    for fn in sorted(target_data.keys()):
+      tf = target_data[fn]
+      assert fn == tf.name
+      sf = ClosestFileMatch(tf, matching_file_cache, renames)
+      if sf is not None and sf.name != tf.name:
+        print("File has moved from " + sf.name + " to " + tf.name)
+        renames[sf.name] = tf
+
+      if sf is None or tf.sha1 != sf.sha1:
+        partition_prefix = partition + "/"
+        zip_file_name = partition_prefix.upper() + tf.name[len(partition_prefix):]
+        d = target_zip.read(zip_file_name)
+        common.ZipWriteStr(output_zip, tf.name, d)
+        if sf is not None:
+          patch_list.append((tf, sf, tf.size, common.sha1(d).hexdigest()))
+      else:
+        # Target file data identical to source (may still be renamed)
+        pass
+
+  def EmitVerification(self, script, package_download_url):
+    error_msg = "You can\'t upgrade to this version, please download full package in " + package_download_url
+    for tf, sf, _, _ in self.patch_list:
+      sf.name = FixUpPartitionPath("/" + sf.name)
+      script.FileCheck(sf.name, sf.sha1, error_msg)
+
+  def RemoveUnneededFiles(self, script, extras=()):
+    file_list = ["/" + i for i in self.source_data
+                  if i not in self.target_data and i not in self.renames]
+    file_list += list(extras)
+    new_file_list = []
+    for unneeded_file in file_list:
+      unneeded_file = FixUpPartitionPath(unneeded_file)
+      print("Removing unneeded file " + unneeded_file)
+      new_file_list.append(unneeded_file)
+
+    # Sort the list in descending order, which removes all the files first
+    # before attempting to remove the folder. (Bug: 22960996)
+    script.DeleteFiles(sorted(new_file_list, reverse=True))
+
+  def EmitRenames(self, script):
+    if len(self.renames) > 0:
+      script.Print("Renaming files...")
+      for src, tgt in self.renames.iteritems():
+        src = FixUpPartitionPath("/" + src)
+        tgt.name = FixUpPartitionPath("/" + tgt.name)
+        print("Renaming " + src + " to " + tgt.name)
+        script.RenameFile(src, tgt.name)
 
 # Images to be excluded from secondary payload. We essentially only keep
 # 'system_other' and bootloader partitions.
